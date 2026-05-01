@@ -82,7 +82,6 @@ class ExecutionService:
             ApiError:       If the execution cannot be claimed (e.g. already running).
         """
         data = self._http.post(f"/executions/{execution_id}/claim")
-        logger.info("Execution %s claimed.", execution_id)
         return Execution.model_validate(data)
 
     def finish(self, execution_id: str, observation: str | None = None) -> Execution:
@@ -107,7 +106,6 @@ class ExecutionService:
             body["observation"] = observation
 
         data = self._http.post(f"/executions/{execution_id}/finish", body or None)
-        logger.info("Execution %s finished with status %s.", execution_id, data.get("status"))
         return Execution.model_validate(data)
 
     def cancel(self, execution_id: str) -> Execution:

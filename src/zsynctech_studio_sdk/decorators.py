@@ -35,21 +35,81 @@ from __future__ import annotations
 
 import functools
 import logging
-import sys
 from collections.abc import Callable
 from typing import Generic, ParamSpec, TypeVar, overload
 
+from rich.logging import RichHandler
+from rich.markup import escape as markup_escape
+
 from .config import SDKConfig
 from .context import get_current_context
-from .models.enums import TaskStatus
+from .models.enums import ExecutionStatus, TaskStatus
 
 logger = logging.getLogger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
+# -- Type aliases for status mappers ------------------------------------------
+
+type TaskStatusMapper = dict[type[BaseException], TaskStatus]
+type ExecutionStatusMapper = dict[type[BaseException], ExecutionStatus]
+
 
 # -- Utilities -----------------------------------------------------------------
+
+
+def _validate_task_mapper(mapper: object, func_name: str) -> None:
+    """Raise ``TypeError`` if *mapper* contains invalid keys or values."""
+    if not isinstance(mapper, dict):
+        raise TypeError(
+            f"{func_name}: status_mapper must be a dict, got {type(mapper).__name__!r}"
+        )
+    for key, value in mapper.items():  # type: ignore[union-attr]
+        if not (isinstance(key, type) and issubclass(key, BaseException)):
+            raise TypeError(
+                f"{func_name}: status_mapper key {key!r} is not an exception class"
+            )
+        if not isinstance(value, TaskStatus):
+            raise TypeError(
+                f"{func_name}: status_mapper value for {key.__name__!r} must be a "
+                f"TaskStatus member, got {value!r}. "
+                f"Use TaskStatus.{value.upper() if isinstance(value, str) else '...'} instead."
+            )
+
+
+def _validate_execution_mapper(mapper: object, func_name: str) -> None:
+    """Raise ``TypeError`` if *mapper* contains invalid keys or values."""
+    if not isinstance(mapper, dict):
+        raise TypeError(
+            f"{func_name}: status_mapper must be a dict, got {type(mapper).__name__!r}"
+        )
+    for key, value in mapper.items():  # type: ignore[union-attr]
+        if not (isinstance(key, type) and issubclass(key, BaseException)):
+            raise TypeError(
+                f"{func_name}: status_mapper key {key!r} is not an exception class"
+            )
+        if not isinstance(value, ExecutionStatus):
+            raise TypeError(
+                f"{func_name}: status_mapper value for {key.__name__!r} must be an "
+                f"ExecutionStatus member, got {value!r}. "
+                f"Use ExecutionStatus.{value.upper() if isinstance(value, str) else '...'} instead."
+            )
+
+
+def _resolve_mapped_status(
+    exc: BaseException,
+    mapper: dict[type[BaseException], TaskStatus] | dict[type[BaseException], ExecutionStatus],
+) -> TaskStatus | ExecutionStatus | None:
+    """Return the first matching status for *exc* from *mapper*, or ``None``.
+
+    Iterates the mapper in insertion order and returns the status for the
+    first entry whose key is a superclass of (or equal to) the exception type.
+    """
+    for exc_type, status in mapper.items():
+        if isinstance(exc, exc_type):
+            return status
+    return None
 
 
 def _name_from_function(func_name: str) -> str:
@@ -77,12 +137,11 @@ def _setup_logging() -> None:
     if root.handlers:
         return
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
-        logging.Formatter(
-            fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-            datefmt="%H:%M:%S",
-        )
+    handler = RichHandler(
+        show_path=False,
+        rich_tracebacks=True,
+        markup=True,
+        log_time_format="%H:%M:%S",
     )
     root.addHandler(handler)
     root.setLevel(logging.INFO)
@@ -106,9 +165,17 @@ class TaskWrapper(Generic[P, R]):
         name: Human-readable task name shown in the platform UI.
     """
 
-    def __init__(self, func: Callable[P, R], name: str) -> None:
+    def __init__(
+        self,
+        func: Callable[P, R],
+        name: str,
+        status_mapper: TaskStatusMapper | None = None,
+    ) -> None:
+        if status_mapper is not None:
+            _validate_task_mapper(status_mapper, func.__name__)
         self._func = func
         self._name = name
+        self._status_mapper = status_mapper
         self._offline_counter: int = 0
         functools.update_wrapper(self, func)
 
@@ -152,13 +219,18 @@ class TaskWrapper(Generic[P, R]):
         """
         order = self._offline_counter
         self._offline_counter += 1
-        logger.info("  [%d] >  %s", order + 1, self._name)
+        logger.info("  [%d] [cyan]▶[/cyan]  %s", order + 1, markup_escape(self._name))
         try:
             result: R = self._func(*args, **kwargs)
         except Exception as exc:
-            logger.error("  [%d] x  %s - %s", order + 1, self._name, exc)
-            raise
-        logger.info("  [%d] v  %s", order + 1, self._name)
+            mapped = _resolve_mapped_status(exc, self._status_mapper) if self._status_mapper else None
+            task_status = mapped if mapped is not None else TaskStatus.ERROR
+            if task_status == TaskStatus.ERROR:
+                logger.error("  [%d] [bold red]✘[/bold red]  %s — %s", order + 1, markup_escape(self._name), markup_escape(str(exc)))
+                raise
+            logger.warning("  [%d] [yellow]⚠[/yellow]  %s — %s [%s]", order + 1, markup_escape(self._name), markup_escape(str(exc)), task_status.value)
+            return None  # type: ignore[return-value]
+        logger.info("  [%d] [green]✔[/green]  %s", order + 1, markup_escape(self._name))
         return result
 
     def _run_tracked(self, ctx: object, *args: P.args, **kwargs: P.kwargs) -> R:
@@ -195,7 +267,7 @@ class TaskWrapper(Generic[P, R]):
             )
             return self._func(*args, **kwargs)
 
-        logger.info("  [%d] >  %s", order + 1, self._name)
+        logger.info("  [%d] [cyan]▶[/cyan]  %s", order + 1, markup_escape(self._name))
 
         # Mark as RUNNING
         try:
@@ -207,17 +279,24 @@ class TaskWrapper(Generic[P, R]):
         try:
             result: R = self._func(*args, **kwargs)
         except Exception as exc:
-            logger.error("  [%d] x  %s - %s", order + 1, self._name, exc)
+            mapped = _resolve_mapped_status(exc, self._status_mapper) if self._status_mapper else None
+            task_status = mapped if mapped is not None else TaskStatus.ERROR
+            if task_status == TaskStatus.ERROR:
+                logger.error("  [%d] [bold red]✘[/bold red]  %s — %s", order + 1, markup_escape(self._name), markup_escape(str(exc)))
+            else:
+                logger.warning("  [%d] [yellow]⚠[/yellow]  %s — %s [%s]", order + 1, markup_escape(self._name), markup_escape(str(exc)), task_status.value)
             try:
                 ctx.task_service.update(
                     ctx.execution_id,
                     task.id,
-                    status=TaskStatus.ERROR,
+                    status=task_status,
                     observation=str(exc),
                 )
             except Exception:
                 pass
-            raise
+            if task_status == TaskStatus.ERROR:
+                raise
+            return None  # type: ignore[return-value]
 
         # Mark as SUCCESS
         try:
@@ -225,7 +304,7 @@ class TaskWrapper(Generic[P, R]):
         except Exception as exc:
             logger.warning("Could not mark task '%s' as SUCCESS: %s", self._name, exc)
 
-        logger.info("  [%d] v  %s", order + 1, self._name)
+        logger.info("  [%d] [green]✔[/green]  %s", order + 1, markup_escape(self._name))
         return result
 
 
@@ -249,9 +328,13 @@ class ExecutionWrapper(Generic[P, R]):
         self,
         func: Callable[P, R],
         config: SDKConfig | None = None,
+        status_mapper: ExecutionStatusMapper | None = None,
     ) -> None:
+        if status_mapper is not None:
+            _validate_execution_mapper(status_mapper, func.__name__)
         self._func = func
         self._config = config
+        self._status_mapper = status_mapper
         functools.update_wrapper(self, func)
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
@@ -297,7 +380,7 @@ class ExecutionWrapper(Generic[P, R]):
         from .runner import RobotRunner
 
         cfg = config or self._config or SDKConfig.from_env()
-        runner = RobotRunner(cfg, self._func)
+        runner = RobotRunner(cfg, self._func, status_mapper=self._status_mapper)
 
         try:
             runner.run()
@@ -313,13 +396,18 @@ def task(func: Callable[P, R]) -> TaskWrapper[P, R]: ...
 
 
 @overload
-def task(*, name: str) -> Callable[[Callable[P, R]], TaskWrapper[P, R]]: ...
+def task(
+    *,
+    name: str | None = None,
+    status_mapper: TaskStatusMapper | None = None,
+) -> Callable[[Callable[P, R]], TaskWrapper[P, R]]: ...
 
 
 def task(
     func: Callable[P, R] | None = None,
     *,
     name: str | None = None,
+    status_mapper: TaskStatusMapper | None = None,
 ) -> TaskWrapper[P, R] | Callable[[Callable[P, R]], TaskWrapper[P, R]]:
     """Decorator that registers and tracks a function as a platform task.
 
@@ -338,9 +426,15 @@ def task(
     throughout its lifecycle.  Outside a listener it runs as-is.
 
     Args:
-        func: The function to decorate (when used without parentheses).
-        name: Custom display name for the platform UI. Defaults to a
-              human-readable version of the function name.
+        func:          The function to decorate (when used without parentheses).
+        name:          Custom display name for the platform UI. Defaults to a
+                       human-readable version of the function name.
+        status_mapper: Optional mapping of exception types to :class:`TaskStatus`
+                       values. When an exception occurs whose type matches a key
+                       (checked via ``isinstance``), the task is finished with
+                       the mapped status instead of the default ``ERROR``. For
+                       any status other than ``ERROR`` the exception is swallowed
+                       and the execution continues normally.
 
     Returns:
         A :class:`TaskWrapper` instance wrapping *func*.
@@ -349,9 +443,9 @@ def task(
         # @task without arguments
         return TaskWrapper(func, name or _name_from_function(func.__name__))
 
-    # @task(name=...) - return a decorator
+    # @task(name=..., status_mapper=...) - return a decorator
     def decorator(fn: Callable[P, R]) -> TaskWrapper[P, R]:
-        return TaskWrapper(fn, name or _name_from_function(fn.__name__))
+        return TaskWrapper(fn, name or _name_from_function(fn.__name__), status_mapper=status_mapper)
 
     return decorator
 
@@ -362,7 +456,9 @@ def execution(func: Callable[P, R]) -> ExecutionWrapper[P, R]: ...
 
 @overload
 def execution(
-    *, config: SDKConfig | None = None
+    *,
+    config: SDKConfig | None = None,
+    status_mapper: ExecutionStatusMapper | None = None,
 ) -> Callable[[Callable[P, R]], ExecutionWrapper[P, R]]: ...
 
 
@@ -370,6 +466,7 @@ def execution(
     func: Callable[P, R] | None = None,
     *,
     config: SDKConfig | None = None,
+    status_mapper: ExecutionStatusMapper | None = None,
 ) -> ExecutionWrapper[P, R] | Callable[[Callable[P, R]], ExecutionWrapper[P, R]]:
     """Decorator that registers a function as the entry-point for a robot execution.
 
@@ -389,8 +486,16 @@ def execution(
         run.listener(config=SDKConfig(...))   # explicit config
 
     Args:
-        func:   The function to decorate (when used without parentheses).
-        config: Optional pre-built configuration.
+        func:          The function to decorate (when used without parentheses).
+        config:        Optional pre-built configuration.
+        status_mapper: Optional mapping of exception types to
+                       :class:`ExecutionStatus` values. When an uncaught
+                       exception escapes the execution function and its type
+                       matches a key (checked via ``isinstance``), the
+                       execution is finished with the mapped status. Mapping
+                       to ``COMPLETED`` suppresses the error and finishes
+                       cleanly; any other status causes the execution to
+                       finish with the error observation recorded.
 
     Returns:
         An :class:`ExecutionWrapper` instance wrapping *func*.
@@ -399,6 +504,6 @@ def execution(
         return ExecutionWrapper(func, config)
 
     def decorator(fn: Callable[P, R]) -> ExecutionWrapper[P, R]:
-        return ExecutionWrapper(fn, config)
+        return ExecutionWrapper(fn, config, status_mapper=status_mapper)
 
     return decorator

@@ -41,7 +41,7 @@ Advanced usage::
 
 from .config import SDKConfig
 from .context import ExecutionContext, get_current_context
-from .decorators import ExecutionWrapper, TaskWrapper, execution, task
+from .decorators import ExecutionWrapper, ExecutionStatusMapper, TaskWrapper, TaskStatusMapper, execution, task
 from .exceptions import (
     ApiError,
     AuthenticationError,
@@ -62,6 +62,9 @@ __all__ = [
     "execution",
     "TaskWrapper",
     "ExecutionWrapper",
+    # Status mappers
+    "TaskStatusMapper",
+    "ExecutionStatusMapper",
     # Runner
     "RobotRunner",
     # HTTP

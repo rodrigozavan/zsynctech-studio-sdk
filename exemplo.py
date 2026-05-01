@@ -12,7 +12,7 @@ Environment variables required:
 
 import time
 
-from zsynctech_studio_sdk import execution, task
+from zsynctech_studio_sdk import ExecutionStatus, TaskStatus, execution, task
 from zsynctech_studio_sdk.config import SDKConfig
 
 
@@ -34,13 +34,26 @@ def process_data() -> None:
     time.sleep(0.8)
 
 
-@task(name="Gravar resultados")
+# RuntimeError is mapped to WARNING: the task finishes with WARNING status and
+# the execution continues normally (exception is NOT re-raised).
+@task(
+    name="Gravar resultados",
+    status_mapper={RuntimeError: TaskStatus.WARNING},
+)
 def save_results() -> None:
     """Simulate persisting the processed data."""
     time.sleep(0.3)
+    raise RuntimeError("Ops, something went wrong while saving results!")
 
 
-@execution
+# If the execution function itself raises an unhandled exception, the mapper
+# controls the final execution status.  Mapping to COMPLETED suppresses the
+# error and finishes cleanly; any other status records the error observation.
+@execution(
+    status_mapper={
+        RuntimeError: ExecutionStatus.CANCELLED,
+    }
+)
 def my_execution() -> None:
     """Full robot execution: initialize → fetch → process → save."""
     initialize()
@@ -52,7 +65,7 @@ def my_execution() -> None:
 if __name__ == "__main__":
     my_execution.listener(
         config=SDKConfig(
-            api_token="zst_CQwafL3MEnFBeucoKe0pGlNte-PZ3vC5hUOjp3cueNk",
+            api_token="zst_wez2HUYi_gsIoE6Ra-7JqasNxEoyD3E8DiXCbzqtT-g",
             instance_id="019de071-a3d4-7fc5-99e2-db357e6d8240",
             poll_interval=5.0,
         )

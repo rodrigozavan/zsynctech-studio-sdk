@@ -25,6 +25,7 @@ from .config import SDKConfig
 from .context import ExecutionContext, _reset_context, _set_context
 from .exceptions import ApiError, AuthenticationError, NotFoundError
 from .http.client import HttpClient
+from .models.enums import ExecutionStatus
 from .services.execution_service import ExecutionService
 from .services.task_service import TaskService
 
@@ -32,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Type alias for the user's execution entry-point
 type ExecutionFunc = Callable[[], None]
+
+# Type alias for an execution status mapper (mirrors the one in decorators.py)
+type ExecutionStatusMapper = dict[type[BaseException], ExecutionStatus]
 
 # How long to wait before retrying after a connection error (seconds).
 _RECONNECT_WAIT_S = 10.0
@@ -58,9 +62,15 @@ class RobotRunner:
         runner.run()   # blocks until Ctrl+C
     """
 
-    def __init__(self, config: SDKConfig, handler: ExecutionFunc) -> None:
+    def __init__(
+        self,
+        config: SDKConfig,
+        handler: ExecutionFunc,
+        status_mapper: ExecutionStatusMapper | None = None,
+    ) -> None:
         self._config = config
         self._handler = handler
+        self._status_mapper = status_mapper
         self._http = HttpClient(config.base_url, config.api_token)
         self._execution_service = ExecutionService(self._http)
         self._task_service = TaskService(self._http)
@@ -78,7 +88,7 @@ class RobotRunner:
                                closed before the exception propagates.
         """
         logger.info(
-            "Robot started. Polling for executions every %.1f s (instance: %s).",
+            "[bold green]Robot started.[/bold green] Polling every [cyan]%.1f s[/cyan] — instance [dim]%s[/dim]",
             self._config.poll_interval,
             self._config.instance_id,
         )
@@ -86,7 +96,7 @@ class RobotRunner:
             self._loop()
         finally:
             self._http.close()
-            logger.info("Robot stopped.")
+            logger.info("[bold]Robot stopped.[/bold]")
 
     # -- Internal helpers ------------------------------------------------------
 
@@ -129,7 +139,6 @@ class RobotRunner:
                 )
                 time.sleep(_RECONNECT_WAIT_S)
                 continue
-                return
             except httpx.ConnectError:
                 logger.warning(
                     "Could not connect to the platform at %s. "
@@ -166,12 +175,12 @@ class RobotRunner:
         Args:
             execution_id: UUID of the execution to process.
         """
-        logger.info("Claiming execution %s.", execution_id)
+        logger.info("Claiming execution [dim]%s[/dim].", execution_id)
 
         try:
             self._execution_service.claim(execution_id)
         except Exception as exc:
-            logger.error("Failed to claim execution %s: %s. Skipping.", execution_id, exc)
+            logger.error("Failed to claim execution [dim]%s[/dim]: %s. Skipping.", execution_id, exc)
             return
 
         ctx = ExecutionContext(
@@ -184,20 +193,41 @@ class RobotRunner:
         observation: str | None = None
 
         try:
-            logger.info("Running execution %s.", execution_id)
+            logger.info("Running execution [dim]%s[/dim].", execution_id)
             self._handler()
         except Exception as exc:
-            logger.error("Execution %s failed: %s", execution_id, exc)
-            observation = str(exc)
+            if self._status_mapper:
+                for exc_type, mapped_status in self._status_mapper.items():
+                    if isinstance(exc, exc_type):
+                        if mapped_status == ExecutionStatus.COMPLETED:
+                            logger.info(
+                                "Execution [dim]%s[/dim]: %s mapped to COMPLETED, finishing cleanly.",
+                                execution_id,
+                                type(exc).__name__,
+                            )
+                        else:
+                            logger.error("Execution %s failed: %s", execution_id, exc)
+                            observation = str(exc)
+                        break
+                else:
+                    logger.error("Execution %s failed: %s", execution_id, exc)
+                    observation = str(exc)
+            else:
+                logger.error("Execution %s failed: %s", execution_id, exc)
+                observation = str(exc)
         finally:
             _reset_context(token)
 
         try:
             finished = self._execution_service.finish(execution_id, observation)
+            status = finished.status.value if hasattr(finished.status, "value") else str(finished.status)
+            color = "green" if "COMPLETED" in status else "red"
             logger.info(
-                "Execution %s finished with status %s.",
+                "Execution [dim]%s[/dim] finished with status [bold %s]%s[/bold %s].",
                 execution_id,
-                finished.status,
+                color,
+                status,
+                color,
             )
         except Exception as exc:
-            logger.error("Failed to finish execution %s: %s", execution_id, exc)
+            logger.error("Failed to finish execution [dim]%s[/dim]: %s", execution_id, exc)
