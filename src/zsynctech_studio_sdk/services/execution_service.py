@@ -84,15 +84,19 @@ class ExecutionService:
         data = self._http.post(f"/executions/{execution_id}/claim")
         return Execution.model_validate(data)
 
-    def finish(self, execution_id: str, observation: str | None = None) -> Execution:
+    def finish(self, execution_id: str, observation: str | None = None, status: ExecutionStatus | None = None) -> Execution:
         """Mark a running execution as finished.
 
-        Calls ``POST /executions/{id}/finish``. The final status (COMPLETED or
-        FAILED) is determined automatically by the platform based on task outcomes.
+        Calls ``POST /executions/{id}/finish``. The final status is determined
+        by the platform based on task outcomes unless *status* is provided
+        explicitly, in which case it overrides automatic determination.
 
         Args:
             execution_id: UUID of the execution to finish.
             observation:  Optional free-text note to attach (e.g. summary or error).
+            status:       Optional explicit terminal status to set
+                          (COMPLETED, FAILED, or CANCELLED). When omitted the
+                          platform decides automatically.
 
         Returns:
             The updated :class:`~zsynctech_studio_sdk.models.Execution`.
@@ -104,6 +108,8 @@ class ExecutionService:
         body: dict[str, Any] = {}
         if observation is not None:
             body["observation"] = observation
+        if status is not None:
+            body["status"] = status.value
 
         data = self._http.post(f"/executions/{execution_id}/finish", body or None)
         return Execution.model_validate(data)

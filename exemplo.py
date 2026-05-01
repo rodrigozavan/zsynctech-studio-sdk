@@ -38,12 +38,11 @@ def process_data() -> None:
 # the execution continues normally (exception is NOT re-raised).
 @task(
     name="Gravar resultados",
-    status_mapper={RuntimeError: TaskStatus.WARNING},
+    status_mapper={RuntimeError: TaskStatus.ERROR},
 )
 def save_results() -> None:
     """Simulate persisting the processed data."""
     time.sleep(0.3)
-    raise RuntimeError("Ops, something went wrong while saving results!")
 
 
 # If the execution function itself raises an unhandled exception, the mapper
@@ -51,7 +50,7 @@ def save_results() -> None:
 # error and finishes cleanly; any other status records the error observation.
 @execution(
     status_mapper={
-        RuntimeError: ExecutionStatus.CANCELLED,
+        RuntimeError: ExecutionStatus.FAILED,
     }
 )
 def my_execution() -> None:
@@ -60,7 +59,6 @@ def my_execution() -> None:
     fetch_data()
     process_data()
     save_results()
-
 
 if __name__ == "__main__":
     my_execution.listener(

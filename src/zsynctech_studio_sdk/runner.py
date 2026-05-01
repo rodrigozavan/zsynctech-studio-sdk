@@ -191,6 +191,7 @@ class RobotRunner:
         token = _set_context(ctx)
 
         observation: str | None = None
+        override_status: ExecutionStatus | None = None
 
         try:
             logger.info("Running execution [dim]%s[/dim].", execution_id)
@@ -199,6 +200,7 @@ class RobotRunner:
             if self._status_mapper:
                 for exc_type, mapped_status in self._status_mapper.items():
                     if isinstance(exc, exc_type):
+                        override_status = mapped_status
                         if mapped_status == ExecutionStatus.COMPLETED:
                             logger.info(
                                 "Execution [dim]%s[/dim]: %s mapped to COMPLETED, finishing cleanly.",
@@ -206,7 +208,12 @@ class RobotRunner:
                                 type(exc).__name__,
                             )
                         else:
-                            logger.error("Execution %s failed: %s", execution_id, exc)
+                            logger.warning(
+                                "Execution [dim]%s[/dim]: %s mapped to %s.",
+                                execution_id,
+                                type(exc).__name__,
+                                mapped_status.value,
+                            )
                             observation = str(exc)
                         break
                 else:
@@ -219,7 +226,7 @@ class RobotRunner:
             _reset_context(token)
 
         try:
-            finished = self._execution_service.finish(execution_id, observation)
+            finished = self._execution_service.finish(execution_id, observation, override_status)
             status = finished.status.value if hasattr(finished.status, "value") else str(finished.status)
             color = "green" if "COMPLETED" in status else "red"
             logger.info(
